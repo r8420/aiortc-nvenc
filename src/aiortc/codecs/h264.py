@@ -17,12 +17,18 @@ from .base import Decoder, Encoder
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BITRATE = 5000000  # 1 Mbps
-MIN_BITRATE = 3000000  # 500 kbps
-MAX_BITRATE = 5000000  # 3 Mbps
+DEFAULT_BITRATE = 4500000  # 4.5 Mbps
+MIN_BITRATE = 3000000  # 3 Mbps
+MAX_BITRATE = 5000000  # 5 Mbps
 
 MAX_FRAME_RATE = 30
-PACKET_MAX = 1300
+PACKET_MAX = 1200
+
+# For WebRTC, decode recovery after packet loss is dramatically improved by:
+# - periodic IDR frames (≈1s GOP)
+# - no B-frames (lower latency + fewer dependencies)
+# - repeating SPS/PPS on keyframes (decoder can resync)
+DEFAULT_GOP_SECONDS = 1.0
 
 NAL_TYPE_FU_A = 28
 NAL_TYPE_STAP_A = 24
@@ -126,7 +132,126 @@ class H264Encoder(Encoder):
         self.buffer_data = b""
         self.buffer_pts: Optional[int] = None
         self.codec: Optional[VideoCodecContext] = None
+        self._codec_name: Optional[str] = None
         self.__target_bitrate = DEFAULT_BITRATE
+
+    @staticmethod
+    def _is_i_frame_hint(frame: av.VideoFrame) -> bool:
+        """
+        Some senders (e.g. our WebRTC track) set frame.pict_type = I to request
+        a keyframe. Stock aiortc passes an explicit force_keyframe flag, but
+        not all calling sites use it. Honor the pict_type hint when present.
+        """
+        try:
+            pt = getattr(frame, "pict_type", None)
+            if pt is None:
+                return False
+            if isinstance(pt, str):
+                return pt.upper().startswith("I")
+            try:
+                return pt == av.video.frame.PictureType.I
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _gop_size_frames() -> int:
+        try:
+            fps = int(MAX_FRAME_RATE) if MAX_FRAME_RATE else 30
+        except Exception:
+            fps = 30
+        try:
+            return max(1, int(round(float(fps) * float(DEFAULT_GOP_SECONDS))))
+        except Exception:
+            return max(1, fps)
+
+    def _try_open_encoder(self, name: str, frame: av.VideoFrame, options: dict[str, str]) -> VideoCodecContext:
+        """
+        Create and open an encoder context. If options are unsupported by the
+        local FFmpeg build, opening will raise.
+        """
+        codec = av.CodecContext.create(name, "w")
+        codec.width = frame.width
+        codec.height = frame.height
+        codec.bit_rate = int(self.target_bitrate)
+        codec.pix_fmt = "yuv420p"
+
+        # Keep framerate/timebase consistent with our WebRTC sender caps.
+        fps = int(MAX_FRAME_RATE) if MAX_FRAME_RATE else 30
+        codec.framerate = fractions.Fraction(fps, 1)
+        codec.time_base = fractions.Fraction(1, fps)
+
+        # Options must be set before open().
+        codec.options = {str(k): str(v) for k, v in (options or {}).items()}
+
+        # Prefer baseline for broadest browser compatibility.
+        try:
+            codec.profile = "Baseline"
+        except Exception:
+            pass
+
+        codec.open()
+        return codec
+
+    def _ensure_codec(self, frame: av.VideoFrame) -> None:
+        if self.codec is not None:
+            return
+
+        gop = self._gop_size_frames()
+
+        # 1) Prefer NVENC when available.
+        nvenc_opts_full = {
+            # low-latency, real-time
+            "tune": "ull",
+            "preset": "fast",
+            # keep dependencies minimal
+            "bf": "0",
+            # ~1s GOP for fast recovery
+            "g": str(gop),
+            # force IDR when keyframe is requested (best-effort; build dependent)
+            "forced-idr": "1",
+            # repeat SPS/PPS on keyframes so decoders can always resync
+            "repeat-headers": "1",
+            # reduce latency lookahead if supported
+            "rc-lookahead": "0",
+            # rate control (best-effort; do not enforce strict CBR here)
+            "rc": "vbr",
+        }
+
+        nvenc_opts_min = {
+            "tune": "ull",
+            "preset": "fast",
+            "bf": "0",
+            "g": str(gop),
+        }
+
+        try:
+            self.codec = self._try_open_encoder("h264_nvenc", frame, nvenc_opts_full)
+            self._codec_name = "h264_nvenc"
+            return
+        except Exception as exc:
+            logger.info("H264Encoder: NVENC(full) unavailable, retrying minimal options: %s", exc)
+
+        try:
+            self.codec = self._try_open_encoder("h264_nvenc", frame, nvenc_opts_min)
+            self._codec_name = "h264_nvenc"
+            return
+        except Exception as exc:
+            logger.warning("H264Encoder: NVENC unavailable, falling back to software H.264: %s", exc)
+
+        # 2) Software fallback while keeping H.264.
+        # NOTE: Options differ from NVENC (x264 expects tune=zerolatency).
+        x264_gop = int(gop)
+        x264_opts = {
+            "preset": "veryfast",
+            "tune": "zerolatency",
+            # Disable scene-cut so keyframes are driven by GOP / explicit requests.
+            # Repeat SPS/PPS to allow decoder resync after loss.
+            "x264opts": f"keyint={x264_gop}:min-keyint={x264_gop}:scenecut=0:repeat-headers=1:bf=0",
+        }
+        self.codec = self._try_open_encoder("libx264", frame, x264_opts)
+        self._codec_name = "libx264"
 
     @staticmethod
     def _packetize_fu_a(data: bytes) -> list[bytes]:
@@ -259,28 +384,16 @@ class H264Encoder(Encoder):
             self.buffer_pts = None
             self.codec = None
 
-        if force_keyframe:
-            # force a complete image
+        # Honor keyframe hints even when aiortc doesn't pass force_keyframe=True.
+        want_keyframe = bool(force_keyframe) or self._is_i_frame_hint(frame)
+        if want_keyframe:
             frame.pict_type = av.video.frame.PictureType.I
         else:
             # reset the picture type, otherwise no B-frames are produced
             frame.pict_type = av.video.frame.PictureType.NONE
 
         if self.codec is None:
-            self.codec = av.CodecContext.create("h264_nvenc", "w")
-            self.codec.width = frame.width
-            self.codec.height = frame.height
-            self.codec.bit_rate = self.target_bitrate
-            self.codec.pix_fmt = "yuv420p"
-            self.codec.framerate = fractions.Fraction(MAX_FRAME_RATE, 1)
-            self.codec.time_base = fractions.Fraction(1, MAX_FRAME_RATE)
-            self.codec.options = {
-                "level": "31",
-                "tune": "zerolatency" if "h264_nvenc" != "h264_nvenc" else "ull",
-                "preset": "fast",
-                "rc": "vbr",
-            }
-            self.codec.profile = "Baseline"
+            self._ensure_codec(frame)
 
         data_to_send = b""
         for package in self.codec.encode(frame):
